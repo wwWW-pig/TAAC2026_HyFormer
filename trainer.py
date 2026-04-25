@@ -110,7 +110,11 @@ class PCVRHyFormerRankingTrainer:
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
-                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
+                     f"reinit_cardinality_threshold={reinit_cardinality_threshold}")
+        if reinit_cardinality_threshold <= 0:
+            logging.info("Sparse embedding re-init is disabled "
+                         "(reinit_cardinality_threshold <= 0)")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -352,7 +356,11 @@ class PCVRHyFormerRankingTrainer:
             # Reference: KuaiShou Tech., "MultiEpoch: Reusing Training Data
             # for Click-Through Rate Prediction",
             # https://arxiv.org/pdf/2305.19531
-            if epoch >= self.reinit_sparse_after_epoch and self.sparse_optimizer is not None:
+            if (
+                self.reinit_cardinality_threshold > 0
+                and epoch >= self.reinit_sparse_after_epoch
+                and self.sparse_optimizer is not None
+            ):
                 # Snapshot Adagrad state per parameter via data_ptr, so state
                 # of low-cardinality embeddings can be preserved across rebuild.
                 old_state: Dict[int, Any] = {}

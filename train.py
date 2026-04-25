@@ -114,6 +114,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seq_causal', action='store_true', default=False,
                         help='Whether the LongerEncoder self-attention uses a causal mask '
                              '(only effective when --seq_encoder_type=longer)')
+    parser.add_argument('--target_aware_query', action='store_true', default=False,
+                        help='Append a pooled current-item token summary when generating '
+                             'per-sequence query tokens, making Query Decoding target-aware')
     parser.add_argument('--action_num', type=int, default=1,
                         help='Classifier output dimension '
                              '(1 = single binary-classification logit; >1 = multi-label)')
@@ -291,6 +294,7 @@ def main() -> None:
         "dropout_rate": args.dropout_rate,
         "seq_top_k": args.seq_top_k,
         "seq_causal": args.seq_causal,
+        "target_aware_query": args.target_aware_query,
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
         "rank_mixer_mode": args.rank_mixer_mode,

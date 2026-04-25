@@ -419,6 +419,9 @@ class MultiSeqQueryGenerator(nn.Module):
     For each sequence i:
         GlobalInfo_i = Concat(F1..FM, MeanPool(Seq_i))
         Q_i = [FFN_{i,1}(GlobalInfo_i), ..., FFN_{i,N}(GlobalInfo_i)]
+
+    When target_aware=True, a pooled current-item token summary is appended to
+    GlobalInfo_i so query decoding is conditioned on the candidate item.
     """
 
     def __init__(
@@ -427,14 +430,17 @@ class MultiSeqQueryGenerator(nn.Module):
         num_ns: int,
         num_queries: int,
         num_sequences: int,
-        hidden_mult: int = 4
+        hidden_mult: int = 4,
+        target_aware: bool = False,
     ) -> None:
         super().__init__()
         self.num_queries = num_queries
         self.num_sequences = num_sequences
         self.d_model = d_model
+        self.target_aware = target_aware
 
-        global_info_dim = (num_ns + 1) * d_model
+        extra_target_dim = 1 if target_aware else 0
+        global_info_dim = (num_ns + 1 + extra_target_dim) * d_model
 
         # LayerNorm on global_info to prevent gradient explosion from large-dim concat
         self.global_info_norm = nn.LayerNorm(global_info_dim)
@@ -457,7 +463,8 @@ class MultiSeqQueryGenerator(nn.Module):
         self,
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
-        seq_padding_masks: list
+        seq_padding_masks: list,
+        target_tokens: Optional[torch.Tensor] = None,
     ) -> list:
         """Generates query tokens for each sequence.
 
@@ -466,12 +473,22 @@ class MultiSeqQueryGenerator(nn.Module):
             seq_tokens_list: List of (B, L_i, D) tensors, length S.
             seq_padding_masks: List of (B, L_i) masks, length S. True
                 indicates padding.
+            target_tokens: Optional (B, M_item, D) candidate-item tokens used
+                only when target_aware=True.
 
         Returns:
             List of (B, Nq, D) query token tensors, length S.
         """
         B = ns_tokens.shape[0]
         ns_flat = ns_tokens.view(B, -1)  # (B, M*D)
+        target_summary = None
+        if self.target_aware:
+            if target_tokens is None:
+                raise ValueError("target_tokens is required when target_aware=True")
+            if target_tokens.shape[1] == 0:
+                target_summary = ns_tokens.new_zeros(B, self.d_model)
+            else:
+                target_summary = target_tokens.mean(dim=1)  # (B, D)
 
         q_tokens_list = []
         for i in range(self.num_sequences):
@@ -482,8 +499,11 @@ class MultiSeqQueryGenerator(nn.Module):
             seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
             seq_pooled = seq_sum / seq_count  # (B, D)
 
-            # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)
-            global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
+            # GlobalInfo_i = Concat(NS_flat, optional item summary, seq_pooled_i)
+            if self.target_aware:
+                global_info = torch.cat([ns_flat, target_summary, seq_pooled], dim=-1)
+            else:
+                global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
             global_info = self.global_info_norm(global_info)
 
             # Generate N query tokens
@@ -1225,6 +1245,7 @@ class PCVRHyFormer(nn.Module):
         rope_base: float = 10000.0,
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
+        target_aware_query: bool = False,
         # NS tokenizer variant
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
@@ -1243,6 +1264,7 @@ class PCVRHyFormer(nn.Module):
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
+        self.target_aware_query = target_aware_query
         self.ns_tokenizer_type = ns_tokenizer_type
 
         # ================== NS Tokens Construction ==================
@@ -1314,6 +1336,25 @@ class PCVRHyFormer(nn.Module):
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0))
+        self.num_user_ns = num_user_ns
+        self.num_item_ns = num_item_ns
+
+        # ns_tokens are concatenated in forward as:
+        # [user_ns] + [optional user_dense] + [item_ns] + [optional item_dense].
+        # Keep slices so target-aware query generation can isolate the current
+        # candidate item representation.
+        offset = 0
+        self.user_ns_slice = slice(offset, offset + num_user_ns)
+        offset += num_user_ns
+        self.user_dense_slice = slice(offset, offset + (1 if self.has_user_dense else 0))
+        offset += 1 if self.has_user_dense else 0
+        item_start = offset
+        self.item_ns_slice = slice(offset, offset + num_item_ns)
+        offset += num_item_ns
+        self.item_dense_slice = slice(offset, offset + (1 if self.has_item_dense else 0))
+        offset += 1 if self.has_item_dense else 0
+        self.item_token_slice = slice(item_start, offset)
+        assert offset == self.num_ns
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1385,6 +1426,7 @@ class PCVRHyFormer(nn.Module):
             num_queries=num_queries,
             num_sequences=self.num_sequences,
             hidden_mult=hidden_mult,
+            target_aware=target_aware_query,
         )
 
         # MultiSeqHyFormerBlock stack
@@ -1481,6 +1523,10 @@ class PCVRHyFormer(nn.Module):
         Returns:
             A set of data_ptr() values for reinitialized parameters.
         """
+        if cardinality_threshold <= 0:
+            logging.info("Embedding re-init disabled because cardinality_threshold <= 0")
+            return set()
+
         reinit_count = 0
         skip_count = 0
         reinit_ptrs = set()
@@ -1647,6 +1693,7 @@ class PCVRHyFormer(nn.Module):
             ns_parts.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+        target_tokens = ns_tokens[:, self.item_token_slice, :]
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
@@ -1662,7 +1709,10 @@ class PCVRHyFormer(nn.Module):
             seq_masks_list.append(mask)
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        q_tokens_list = self.query_generator(
+            ns_tokens, seq_tokens_list, seq_masks_list,
+            target_tokens=target_tokens if self.target_aware_query else None,
+        )
 
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
@@ -1690,6 +1740,7 @@ class PCVRHyFormer(nn.Module):
             ns_parts.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
+        target_tokens = ns_tokens[:, self.item_token_slice, :]
 
         seq_tokens_list = []
         seq_masks_list = []
@@ -1703,7 +1754,10 @@ class PCVRHyFormer(nn.Module):
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        q_tokens_list = self.query_generator(
+            ns_tokens, seq_tokens_list, seq_masks_list,
+            target_tokens=target_tokens if self.target_aware_query else None,
+        )
 
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
