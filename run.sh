@@ -10,6 +10,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --num_queries 2 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
+    --reinit_cardinality_threshold 10000 \
     --num_workers 8 \
     "$@"
 
