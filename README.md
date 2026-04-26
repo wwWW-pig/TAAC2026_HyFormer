@@ -93,24 +93,38 @@ Each HyFormer block performs:
 The final query tokens are concatenated, projected, and fed into a binary
 classifier.
 
-## Target-Aware Query
+## Target-Aware MIND Query
 
-This branch adds an optional target-aware query generator:
+This branch adds two query-generation modes:
 
 ```bash
 --target_aware_query
+--query_generator_type mlp|mind
 ```
 
-When enabled, the query generator explicitly conditions each per-sequence query
-on the current candidate item representation:
+The `mlp` mode is the previous pooled-sequence generator. When
+`--target_aware_query` is enabled, it explicitly conditions each per-sequence
+query on the current candidate item representation:
 
 ```text
 old: query = MLP([NS_flat, seq_pooled])
 new: query = MLP([NS_flat, item_summary, seq_pooled])
 ```
 
-`item_summary` is the mean-pooled item-side NS token slice. The flag is disabled
-by default so the original baseline can still be reproduced directly.
+The new `mind` mode replaces pooled query generation with target-aware
+multi-interest dynamic routing:
+
+```text
+seq tokens + item_summary + NS context
+        -> dynamic routing
+        -> multiple interest query capsules
+        -> Query Decoding
+```
+
+Each query has a learnable query-type embedding, so different queries have
+separate identities before routing. `item_summary` is the mean-pooled item-side
+NS token slice and conditions the routing process on the current candidate
+item.
 
 ## Sparse Re-Init
 
@@ -160,6 +174,8 @@ Run with target-aware query:
 ```bash
 python train.py \
   --target_aware_query \
+  --query_generator_type mind \
+  --mind_routing_iters 3 \
   --batch_size 256 \
   --loss_type bce
 ```
@@ -171,6 +187,8 @@ python train.py \
 - `--seq_max_lens`: per-domain sequence truncation, e.g. `seq_a:256,seq_b:256`.
 - `--seq_encoder_type`: `swiglu`, `transformer`, or `longer`.
 - `--num_queries`: number of query tokens generated per sequence domain.
+- `--query_generator_type`: `mlp` or `mind`.
+- `--mind_routing_iters`: dynamic-routing iterations for target-aware MIND.
 - `--rank_mixer_mode`: `full`, `ffn_only`, or `none`.
 - `--loss_type`: `bce` or `focal`.
 - `--reinit_cardinality_threshold`: embeddings with larger vocab size are
@@ -180,7 +198,7 @@ python train.py \
 
 Useful first experiments:
 
-- Baseline vs `--target_aware_query`.
+- Baseline vs `--target_aware_query --query_generator_type mind`.
 - `ns_tokenizer_type=rankmixer` vs `group`.
 - Different `user_ns_tokens` and `item_ns_tokens`.
 - Different `seq_max_lens` per sequence domain.

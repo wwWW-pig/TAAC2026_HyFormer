@@ -415,13 +415,13 @@ class RankMixerBlock(nn.Module):
 class MultiSeqQueryGenerator(nn.Module):
     """Multi-sequence query generation module.
 
-    Generates Q tokens independently for each sequence:
-    For each sequence i:
-        GlobalInfo_i = Concat(F1..FM, MeanPool(Seq_i))
-        Q_i = [FFN_{i,1}(GlobalInfo_i), ..., FFN_{i,N}(GlobalInfo_i)]
+    Supports two query-generation variants:
+      - mlp: the original pooled-sequence MLP generator.
+      - mind: target-aware multi-interest dynamic routing over sequence tokens.
 
     When target_aware=True, a pooled current-item token summary is appended to
-    GlobalInfo_i so query decoding is conditioned on the candidate item.
+    the query-generation context so query decoding is conditioned on the
+    candidate item.
     """
 
     def __init__(
@@ -432,15 +432,23 @@ class MultiSeqQueryGenerator(nn.Module):
         num_sequences: int,
         hidden_mult: int = 4,
         target_aware: bool = False,
+        generator_type: str = 'mlp',
+        routing_iters: int = 3,
     ) -> None:
         super().__init__()
         self.num_queries = num_queries
         self.num_sequences = num_sequences
         self.d_model = d_model
         self.target_aware = target_aware
+        self.generator_type = generator_type
+        self.routing_iters = routing_iters
+
+        if generator_type not in {'mlp', 'mind'}:
+            raise ValueError(f"Unknown query generator type: {generator_type}")
 
         extra_target_dim = 1 if target_aware else 0
         global_info_dim = (num_ns + 1 + extra_target_dim) * d_model
+        ns_context_dim = (num_ns + extra_target_dim) * d_model
 
         # LayerNorm on global_info to prevent gradient explosion from large-dim concat
         self.global_info_norm = nn.LayerNorm(global_info_dim)
@@ -458,6 +466,45 @@ class MultiSeqQueryGenerator(nn.Module):
             ])
             for _ in range(num_sequences)
         ])
+
+        # MIND-style target-aware multi-interest routing.
+        self.query_type_emb = nn.Parameter(
+            torch.randn(num_sequences, num_queries, d_model) * 0.02
+        )
+        self.mind_context_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(ns_context_dim, d_model * hidden_mult),
+                nn.SiLU(),
+                nn.Linear(d_model * hidden_mult, d_model),
+                nn.LayerNorm(d_model),
+            )
+            for _ in range(num_sequences)
+        ])
+        self.mind_token_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model * 3, d_model * hidden_mult),
+                nn.SiLU(),
+                nn.Linear(d_model * hidden_mult, d_model),
+                nn.LayerNorm(d_model),
+            )
+            for _ in range(num_sequences)
+        ])
+        self.mind_query_refiners = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_model * 3, d_model * hidden_mult),
+                nn.SiLU(),
+                nn.Linear(d_model * hidden_mult, d_model),
+                nn.LayerNorm(d_model),
+            )
+            for _ in range(num_sequences)
+        ])
+
+    @staticmethod
+    def _squash(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """Capsule squash nonlinearity used by MIND-style routing."""
+        squared_norm = (x * x).sum(dim=-1, keepdim=True)
+        scale = squared_norm / (1.0 + squared_norm)
+        return scale * x / torch.sqrt(squared_norm + eps)
 
     def forward(
         self,
@@ -481,14 +528,20 @@ class MultiSeqQueryGenerator(nn.Module):
         """
         B = ns_tokens.shape[0]
         ns_flat = ns_tokens.view(B, -1)  # (B, M*D)
-        target_summary = None
+        target_summary = ns_tokens.new_zeros(B, self.d_model)
         if self.target_aware:
             if target_tokens is None:
                 raise ValueError("target_tokens is required when target_aware=True")
-            if target_tokens.shape[1] == 0:
-                target_summary = ns_tokens.new_zeros(B, self.d_model)
-            else:
+            if target_tokens.shape[1] > 0:
                 target_summary = target_tokens.mean(dim=1)  # (B, D)
+
+        if self.generator_type == 'mind':
+            return self._forward_mind(
+                ns_flat=ns_flat,
+                target_summary=target_summary,
+                seq_tokens_list=seq_tokens_list,
+                seq_padding_masks=seq_padding_masks,
+            )
 
         q_tokens_list = []
         for i in range(self.num_sequences):
@@ -509,6 +562,58 @@ class MultiSeqQueryGenerator(nn.Module):
             # Generate N query tokens
             queries = [ffn(global_info) for ffn in self.query_ffns_per_seq[i]]
             q_tokens = torch.stack(queries, dim=1)  # (B, Nq, D)
+            q_tokens_list.append(q_tokens)
+
+        return q_tokens_list
+
+    def _forward_mind(
+        self,
+        ns_flat: torch.Tensor,
+        target_summary: torch.Tensor,
+        seq_tokens_list: list,
+        seq_padding_masks: list,
+    ) -> list:
+        """Generate queries with target-aware MIND dynamic routing.
+
+        Each sequence token votes for one of N query capsules. Query type
+        embeddings provide distinct capsule identities, while the current item
+        summary conditions both the routing context and token votes.
+        """
+        B = ns_flat.shape[0]
+        if self.target_aware:
+            context_input = torch.cat([ns_flat, target_summary], dim=-1)
+        else:
+            context_input = ns_flat
+
+        q_tokens_list = []
+        for i in range(self.num_sequences):
+            seq_tokens = seq_tokens_list[i]  # (B, L, D)
+            padding_mask = seq_padding_masks[i]  # (B, L), True = padding
+            L = seq_tokens.shape[1]
+
+            context = self.mind_context_projs[i](context_input)  # (B, D)
+            context_expand = context.unsqueeze(1).expand(-1, L, -1)
+            target_expand = target_summary.unsqueeze(1).expand(-1, L, -1)
+            token_input = torch.cat([seq_tokens, target_expand, context_expand], dim=-1)
+            votes = self.mind_token_projs[i](token_input)  # (B, L, D)
+            votes = votes * (~padding_mask).unsqueeze(-1).float()
+
+            seeds = self.query_type_emb[i].unsqueeze(0) + context.unsqueeze(1)
+            routing_logits = torch.einsum('bld,bkd->blk', votes, seeds) / math.sqrt(self.d_model)
+
+            valid = (~padding_mask).float()
+            for _ in range(max(1, self.routing_iters)):
+                assign = torch.softmax(routing_logits, dim=-1) * valid.unsqueeze(-1)
+                denom = assign.sum(dim=1).clamp(min=1e-6).unsqueeze(-1)
+                interests = torch.einsum('blk,bld->bkd', assign, votes) / denom
+                interests = self._squash(interests)
+                agreement = torch.einsum('bld,bkd->blk', votes, interests)
+                routing_logits = routing_logits + agreement
+
+            target_expand_q = target_summary.unsqueeze(1).expand(-1, self.num_queries, -1)
+            context_expand_q = context.unsqueeze(1).expand(-1, self.num_queries, -1)
+            query_input = torch.cat([interests, target_expand_q, context_expand_q], dim=-1)
+            q_tokens = self.mind_query_refiners[i](query_input)
             q_tokens_list.append(q_tokens)
 
         return q_tokens_list
@@ -1246,6 +1351,8 @@ class PCVRHyFormer(nn.Module):
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
         target_aware_query: bool = False,
+        query_generator_type: str = 'mlp',
+        mind_routing_iters: int = 3,
         # NS tokenizer variant
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
@@ -1265,6 +1372,8 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.target_aware_query = target_aware_query
+        self.query_generator_type = query_generator_type
+        self.mind_routing_iters = mind_routing_iters
         self.ns_tokenizer_type = ns_tokenizer_type
 
         # ================== NS Tokens Construction ==================
@@ -1427,6 +1536,8 @@ class PCVRHyFormer(nn.Module):
             num_sequences=self.num_sequences,
             hidden_mult=hidden_mult,
             target_aware=target_aware_query,
+            generator_type=query_generator_type,
+            routing_iters=mind_routing_iters,
         )
 
         # MultiSeqHyFormerBlock stack

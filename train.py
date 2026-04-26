@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
     parser.add_argument('--train_ratio', type=float, default=1.0,
-                        help='Fraction of training Row Groups to use (takes the first N%)')
+                        help='Fraction of training Row Groups to use (takes the first N%%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
@@ -117,6 +117,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--target_aware_query', action='store_true', default=False,
                         help='Append a pooled current-item token summary when generating '
                              'per-sequence query tokens, making Query Decoding target-aware')
+    parser.add_argument('--query_generator_type', type=str, default='mlp',
+                        choices=['mlp', 'mind'],
+                        help='Query generator variant: mlp = pooled-sequence MLP, '
+                             'mind = target-aware multi-interest dynamic routing')
+    parser.add_argument('--mind_routing_iters', type=int, default=3,
+                        help='Number of dynamic-routing iterations used by '
+                             '--query_generator_type=mind')
     parser.add_argument('--action_num', type=int, default=1,
                         help='Classifier output dimension '
                              '(1 = single binary-classification logit; >1 = multi-label)')
@@ -295,6 +302,8 @@ def main() -> None:
         "seq_top_k": args.seq_top_k,
         "seq_causal": args.seq_causal,
         "target_aware_query": args.target_aware_query,
+        "query_generator_type": args.query_generator_type,
+        "mind_routing_iters": args.mind_routing_iters,
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
         "rank_mixer_mode": args.rank_mixer_mode,
