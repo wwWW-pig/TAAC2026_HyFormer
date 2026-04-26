@@ -112,7 +112,7 @@ new: query = MLP([NS_flat, item_summary, seq_pooled])
 `item_summary` is the mean-pooled item-side NS token slice. The flag is disabled
 by default so the original baseline can still be reproduced directly.
 
-## Sparse Re-Init Fix
+## Sparse Re-Init
 
 The baseline includes an optional high-cardinality embedding re-initialization
 strategy controlled by:
@@ -122,10 +122,11 @@ strategy controlled by:
 --reinit_sparse_after_epoch
 ```
 
-`reinit_cardinality_threshold=0` now correctly disables sparse embedding
-re-initialization. When the threshold is greater than 0, only embedding tables
-whose vocabulary size exceeds the threshold are re-initialized after the
-configured epoch.
+Embedding tables whose vocabulary size exceeds `reinit_cardinality_threshold`
+are re-initialized after the configured epoch. With the default
+`reinit_cardinality_threshold=0`, every embedding table with `vocab_size > 0`
+is re-initialized. This keeps the original cold-restart behavior, which can help
+reduce overfitting on high-cardinality sparse IDs.
 
 ## Running
 
@@ -172,7 +173,8 @@ python train.py \
 - `--num_queries`: number of query tokens generated per sequence domain.
 - `--rank_mixer_mode`: `full`, `ffn_only`, or `none`.
 - `--loss_type`: `bce` or `focal`.
-- `--reinit_cardinality_threshold`: `0` disables embedding re-init.
+- `--reinit_cardinality_threshold`: embeddings with larger vocab size are
+  re-initialized; `0` resets every embedding with `vocab_size > 0`.
 
 ## Suggested Ablations
 

@@ -1523,10 +1523,6 @@ class PCVRHyFormer(nn.Module):
         Returns:
             A set of data_ptr() values for reinitialized parameters.
         """
-        if cardinality_threshold <= 0:
-            logging.info("Embedding re-init disabled because cardinality_threshold <= 0")
-            return set()
-
         reinit_count = 0
         skip_count = 0
         reinit_ptrs = set()

@@ -161,7 +161,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--reinit_cardinality_threshold', type=int, default=0,
                         help='Cardinality threshold used by the re-init strategy: '
                              'Embeddings whose vocab_size exceeds this value are reset '
-                             'at each epoch end (0 = never reset any Embedding)')
+                             'at each epoch end (0 = reset every Embedding with vocab_size > 0)')
 
     # Embedding construction control.
     parser.add_argument('--emb_skip_threshold', type=int, default=0,
