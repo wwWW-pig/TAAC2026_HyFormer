@@ -11,6 +11,9 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --target_aware_query \
     --query_generator_type mind \
     --mind_routing_iters 3 \
+    --use_domain_embedding \
+    --use_attention_bias \
+    --use_explicit_cross_head \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --reinit_cardinality_threshold 0 \

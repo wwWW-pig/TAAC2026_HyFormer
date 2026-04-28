@@ -124,6 +124,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--mind_routing_iters', type=int, default=3,
                         help='Number of dynamic-routing iterations used by '
                              '--query_generator_type=mind')
+    parser.add_argument('--use_domain_embedding', action='store_true', default=False,
+                        help='Add a learnable domain embedding to each sequence token '
+                             'so seq_a/seq_b/... keep explicit domain identity')
+    parser.add_argument('--use_attention_bias', action='store_true', default=False,
+                        help='Add target/time/domain additive bias to query-to-sequence '
+                             'cross attention')
+    parser.add_argument('--use_explicit_cross_head', action='store_true', default=False,
+                        help='After Query Boosting, add explicit feature crosses between '
+                             'HyFormer output, user summary, and target item summary')
     parser.add_argument('--action_num', type=int, default=1,
                         help='Classifier output dimension '
                              '(1 = single binary-classification logit; >1 = multi-label)')
@@ -304,6 +313,9 @@ def main() -> None:
         "target_aware_query": args.target_aware_query,
         "query_generator_type": args.query_generator_type,
         "mind_routing_iters": args.mind_routing_iters,
+        "use_domain_embedding": args.use_domain_embedding,
+        "use_attention_bias": args.use_attention_bias,
+        "use_explicit_cross_head": args.use_explicit_cross_head,
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
         "rank_mixer_mode": args.rank_mixer_mode,

@@ -154,6 +154,7 @@ class RoPEMultiheadAttention(nn.Module):
         value: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
+        attn_bias: Optional[torch.Tensor] = None,
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
         q_rope_cos: Optional[torch.Tensor] = None,
@@ -168,6 +169,8 @@ class RoPEMultiheadAttention(nn.Module):
             value: (B, Lk, D)
             key_padding_mask: (B, Lk), True indicates padding positions.
             attn_mask: (Lq, Lk) or (B*num_heads, Lq, Lk), additive mask.
+            attn_bias: Additive attention bias, either (B, Lq, Lk) or
+                (B, num_heads, Lq, Lk). Positive values increase attention.
             rope_cos: (1, L, head_dim), RoPE for KV side (also used for Q
                 unless q_rope_* is provided).
             rope_sin: Same shape as rope_cos.
@@ -203,23 +206,43 @@ class RoPEMultiheadAttention(nn.Module):
                 q_sin = q_rope_sin if q_rope_sin is not None else rope_sin
                 Q = apply_rope_to_tensor(Q, q_cos, q_sin)
 
-        # 4. Convert key_padding_mask to SDPA format
+        # 4. Build SDPA mask. Use additive masks when bias is present so the
+        # model can inject target/time/domain priors into attention logits.
         sdpa_attn_mask = None
+        if attn_bias is not None:
+            if attn_bias.dim() == 3:
+                sdpa_attn_mask = attn_bias.unsqueeze(1).expand(B, self.num_heads, Lq, Lk)
+            elif attn_bias.dim() == 4:
+                sdpa_attn_mask = attn_bias.expand(B, self.num_heads, Lq, Lk)
+            else:
+                raise ValueError("attn_bias must have shape (B,Lq,Lk) or (B,H,Lq,Lk)")
+            sdpa_attn_mask = sdpa_attn_mask.to(dtype=Q.dtype, device=Q.device)
+
         if key_padding_mask is not None:
-            # key_padding_mask: (B, Lk), True = padding
-            # SDPA expects (B, 1, 1, Lk) bool mask, True = attend
-            sdpa_attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Lk)
-            sdpa_attn_mask = sdpa_attn_mask.expand(B, self.num_heads, Lq, Lk)
+            padding = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Lk)
+            if sdpa_attn_mask is None:
+                # Keep the old bool-mask path when no additive bias is used.
+                sdpa_attn_mask = ~padding
+                sdpa_attn_mask = sdpa_attn_mask.expand(B, self.num_heads, Lq, Lk)
+            else:
+                sdpa_attn_mask = sdpa_attn_mask.masked_fill(
+                    padding, torch.finfo(Q.dtype).min
+                )
 
         if attn_mask is not None:
-            # attn_mask: additive float mask (Lq, Lk), -inf means do not attend
-            # Convert to bool: positions that are not -inf are True
-            bool_attn = (attn_mask == 0)  # (Lq, Lk)
-            bool_attn = bool_attn.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, Lq, Lk)
-            if sdpa_attn_mask is not None:
-                sdpa_attn_mask = sdpa_attn_mask & bool_attn
+            if sdpa_attn_mask is not None and sdpa_attn_mask.dtype != torch.bool:
+                additive_attn = attn_mask.to(dtype=Q.dtype, device=Q.device)
+                additive_attn = additive_attn.unsqueeze(0).unsqueeze(0)
+                sdpa_attn_mask = sdpa_attn_mask + additive_attn
             else:
-                sdpa_attn_mask = bool_attn
+                # attn_mask: additive float mask (Lq, Lk), -inf means do not attend.
+                # Convert to bool for the no-bias SDPA fast path.
+                bool_attn = (attn_mask == 0)  # (Lq, Lk)
+                bool_attn = bool_attn.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, Lq, Lk)
+                if sdpa_attn_mask is not None:
+                    sdpa_attn_mask = sdpa_attn_mask & bool_attn
+                else:
+                    sdpa_attn_mask = bool_attn
 
         # 5. Scaled Dot-Product Attention
         dropout_p = self.dropout if self.training else 0.0
@@ -228,6 +251,10 @@ class RoPEMultiheadAttention(nn.Module):
             attn_mask=sdpa_attn_mask,
             dropout_p=dropout_p,
         )  # (B, num_heads, Lq, head_dim)
+
+        if key_padding_mask is not None:
+            has_valid_key = (~key_padding_mask).any(dim=-1).view(B, 1, 1, 1)
+            out = out * has_valid_key.to(dtype=out.dtype)
 
         # Replace NaN from all-padding softmax with 0 (zero vectors preserve original input via residual)
         out = torch.nan_to_num(out, nan=0.0)
@@ -274,6 +301,7 @@ class CrossAttention(nn.Module):
         query: torch.Tensor,
         key_value: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
+        attn_bias: Optional[torch.Tensor] = None,
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -283,6 +311,7 @@ class CrossAttention(nn.Module):
             query: (B, Nq, D), query tokens.
             key_value: (B, L, D), sequence tokens.
             key_padding_mask: (B, L), True indicates padding positions.
+            attn_bias: Optional additive bias over attention logits.
             rope_cos: (1, L, head_dim), KV-side RoPE cosine values.
             rope_sin: (1, L, head_dim), KV-side RoPE sine values.
 
@@ -300,6 +329,7 @@ class CrossAttention(nn.Module):
             key=key_value,
             value=key_value,
             key_padding_mask=key_padding_mask,
+            attn_bias=attn_bias,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
         )
@@ -992,12 +1022,17 @@ class MultiSeqHyFormerBlock(nn.Module):
         dropout: float = 0.0,
         top_k: int = 50,
         causal: bool = False,
-        rank_mixer_mode: str = 'full'
+        rank_mixer_mode: str = 'full',
+        use_attention_bias: bool = False,
+        num_time_buckets: int = 0,
     ) -> None:
         super().__init__()
         self.num_sequences = num_sequences
         self.num_queries = num_queries
         self.num_ns = num_ns
+        self.num_heads = num_heads
+        self.d_model = d_model
+        self.use_attention_bias = use_attention_bias
 
         # Independent sequence encoder per sequence
         self.seq_encoders = nn.ModuleList([
@@ -1034,6 +1069,78 @@ class MultiSeqHyFormerBlock(nn.Module):
             mode=rank_mixer_mode
         )
 
+        if use_attention_bias:
+            self.target_bias_q = nn.ModuleList([
+                nn.Linear(d_model, d_model, bias=False)
+                for _ in range(num_sequences)
+            ])
+            self.target_bias_k = nn.ModuleList([
+                nn.Linear(d_model, d_model, bias=False)
+                for _ in range(num_sequences)
+            ])
+            self.target_bias_scale = nn.Parameter(
+                torch.full((num_sequences, num_heads), 0.1)
+            )
+            self.domain_attn_bias = nn.Parameter(
+                torch.zeros(num_sequences, num_heads)
+            )
+            if num_time_buckets > 0:
+                self.time_attn_bias = nn.Embedding(num_time_buckets, num_heads, padding_idx=0)
+                nn.init.zeros_(self.time_attn_bias.weight)
+            else:
+                self.time_attn_bias = None
+        else:
+            self.target_bias_q = None
+            self.target_bias_k = None
+            self.time_attn_bias = None
+
+    def _align_time_buckets(
+        self,
+        time_bucket_ids: Optional[torch.Tensor],
+        target_len: int,
+    ) -> Optional[torch.Tensor]:
+        if time_bucket_ids is None:
+            return None
+        if time_bucket_ids.shape[1] == target_len:
+            return time_bucket_ids
+        if time_bucket_ids.shape[1] > target_len:
+            return time_bucket_ids[:, -target_len:]
+        pad_len = target_len - time_bucket_ids.shape[1]
+        return F.pad(time_bucket_ids, (pad_len, 0), value=0)
+
+    def _build_cross_attn_bias(
+        self,
+        domain_idx: int,
+        query: torch.Tensor,
+        seq_tokens: torch.Tensor,
+        target_summary: Optional[torch.Tensor] = None,
+        time_bucket_ids: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        if not self.use_attention_bias:
+            return None
+
+        B, L, _ = seq_tokens.shape
+        Nq = query.shape[1]
+        bias = seq_tokens.new_zeros(B, self.num_heads, Nq, L)
+
+        if target_summary is not None:
+            tq = self.target_bias_q[domain_idx](target_summary)  # (B, D)
+            tk = self.target_bias_k[domain_idx](seq_tokens)      # (B, L, D)
+            target_score = torch.einsum('bd,bld->bl', tq, tk) / math.sqrt(self.d_model)
+            target_score = torch.tanh(target_score).unsqueeze(1).unsqueeze(2)
+            scale = self.target_bias_scale[domain_idx].view(1, self.num_heads, 1, 1)
+            bias = bias + target_score * scale
+
+        if self.time_attn_bias is not None and time_bucket_ids is not None:
+            aligned_time = self._align_time_buckets(time_bucket_ids, L)
+            time_bias = self.time_attn_bias(aligned_time)  # (B, L, H)
+            time_bias = time_bias.permute(0, 2, 1).unsqueeze(2)  # (B, H, 1, L)
+            bias = bias + time_bias
+
+        domain_bias = self.domain_attn_bias[domain_idx].view(1, self.num_heads, 1, 1)
+        bias = bias + domain_bias
+        return bias
+
     def forward(
         self,
         q_tokens_list: list,
@@ -1042,6 +1149,8 @@ class MultiSeqHyFormerBlock(nn.Module):
         seq_padding_masks: list,
         rope_cos_list: Optional[List[torch.Tensor]] = None,
         rope_sin_list: Optional[List[torch.Tensor]] = None,
+        target_summary: Optional[torch.Tensor] = None,
+        seq_time_buckets_list: Optional[list] = None,
     ) -> Tuple[list, torch.Tensor, list, list]:
         """Processes one multi-sequence HyFormer block step.
 
@@ -1052,6 +1161,9 @@ class MultiSeqHyFormerBlock(nn.Module):
             seq_padding_masks: List of (B, L_i) masks, length S.
             rope_cos_list: List of (1, L_i, head_dim) tensors, length S.
             rope_sin_list: List of (1, L_i, head_dim) tensors, length S.
+            target_summary: Optional (B, D) current-item summary used for
+                target-aware attention bias.
+            seq_time_buckets_list: Optional list of (B, L_i) time bucket ids.
 
         Returns:
             A tuple (next_q_list, next_ns, next_seq_list, next_masks), where
@@ -1082,8 +1194,17 @@ class MultiSeqHyFormerBlock(nn.Module):
         for i in range(S):
             rc = rope_cos_list[i] if rope_cos_list is not None else None
             rs = rope_sin_list[i] if rope_sin_list is not None else None
+            time_ids = seq_time_buckets_list[i] if seq_time_buckets_list is not None else None
+            attn_bias = self._build_cross_attn_bias(
+                domain_idx=i,
+                query=q_tokens_list[i],
+                seq_tokens=next_seqs[i],
+                target_summary=target_summary,
+                time_bucket_ids=time_ids,
+            )
             decoded_q_i = self.cross_attns[i](
                 q_tokens_list[i], next_seqs[i], next_masks[i],
+                attn_bias=attn_bias,
                 rope_cos=rc, rope_sin=rs,
             )
             decoded_qs.append(decoded_q_i)
@@ -1353,6 +1474,9 @@ class PCVRHyFormer(nn.Module):
         target_aware_query: bool = False,
         query_generator_type: str = 'mlp',
         mind_routing_iters: int = 3,
+        use_domain_embedding: bool = False,
+        use_attention_bias: bool = False,
+        use_explicit_cross_head: bool = False,
         # NS tokenizer variant
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
@@ -1374,6 +1498,9 @@ class PCVRHyFormer(nn.Module):
         self.target_aware_query = target_aware_query
         self.query_generator_type = query_generator_type
         self.mind_routing_iters = mind_routing_iters
+        self.use_domain_embedding = use_domain_embedding
+        self.use_attention_bias = use_attention_bias
+        self.use_explicit_cross_head = use_explicit_cross_head
         self.ns_tokenizer_type = ns_tokenizer_type
 
         # ================== NS Tokens Construction ==================
@@ -1458,6 +1585,7 @@ class PCVRHyFormer(nn.Module):
         self.user_dense_slice = slice(offset, offset + (1 if self.has_user_dense else 0))
         offset += 1 if self.has_user_dense else 0
         item_start = offset
+        self.user_token_slice = slice(0, item_start)
         self.item_ns_slice = slice(offset, offset + num_item_ns)
         offset += num_item_ns
         self.item_dense_slice = slice(offset, offset + (1 if self.has_item_dense else 0))
@@ -1527,6 +1655,11 @@ class PCVRHyFormer(nn.Module):
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
 
+        if use_domain_embedding:
+            self.domain_embedding = nn.Embedding(self.num_sequences, d_model)
+        else:
+            self.domain_embedding = None
+
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
         self.query_generator = MultiSeqQueryGenerator(
@@ -1554,6 +1687,8 @@ class PCVRHyFormer(nn.Module):
                 top_k=seq_top_k,
                 causal=seq_causal,
                 rank_mixer_mode=rank_mixer_mode,
+                use_attention_bias=use_attention_bias,
+                num_time_buckets=num_time_buckets,
             )
             for _ in range(num_hyformer_blocks)
         ])
@@ -1570,6 +1705,18 @@ class PCVRHyFormer(nn.Module):
             nn.Linear(num_queries * self.num_sequences * d_model, d_model),
             nn.LayerNorm(d_model),
         )
+
+        if use_explicit_cross_head:
+            self.cross_feature_proj = nn.Sequential(
+                nn.Linear(d_model * 5, d_model * hidden_mult),
+                nn.LayerNorm(d_model * hidden_mult),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(d_model * hidden_mult, d_model),
+                nn.LayerNorm(d_model),
+            )
+        else:
+            self.cross_feature_proj = None
 
         # Dropout
         self.emb_dropout = nn.Dropout(dropout_rate)
@@ -1619,6 +1766,9 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+
+        if self.domain_embedding is not None:
+            nn.init.xavier_normal_(self.domain_embedding.weight.data)
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1740,6 +1890,8 @@ class PCVRHyFormer(nn.Module):
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
         seq_masks_list: list,
+        target_summary: Optional[torch.Tensor] = None,
+        seq_time_buckets_list: Optional[list] = None,
         apply_dropout: bool = True
     ) -> torch.Tensor:
         """Runs the multi-sequence block stack with dropout and output projection."""
@@ -1774,6 +1926,8 @@ class PCVRHyFormer(nn.Module):
                 seq_padding_masks=curr_masks,
                 rope_cos_list=rope_cos_list,
                 rope_sin_list=rope_sin_list,
+                target_summary=target_summary,
+                seq_time_buckets_list=seq_time_buckets_list,
             )
 
         # Output: concatenate all sequences' Q tokens then project via MLP
@@ -1783,6 +1937,31 @@ class PCVRHyFormer(nn.Module):
         output = self.output_proj(output)  # (B, D)
 
         return output
+
+    def _mean_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.shape[1] == 0:
+            return tokens.new_zeros(tokens.shape[0], self.d_model)
+        return tokens.mean(dim=1)
+
+    def _apply_explicit_cross_head(
+        self,
+        hyformer_output: torch.Tensor,
+        ns_tokens: torch.Tensor,
+        target_summary: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.cross_feature_proj is None:
+            return hyformer_output
+
+        user_summary = self._mean_tokens(ns_tokens[:, self.user_token_slice, :])
+        cross_features = torch.cat([
+            hyformer_output,
+            target_summary,
+            hyformer_output * target_summary,
+            torch.abs(hyformer_output - target_summary),
+            user_summary * target_summary,
+        ], dim=-1)
+        crossed = self.cross_feature_proj(cross_features)
+        return hyformer_output + crossed
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
@@ -1801,19 +1980,30 @@ class PCVRHyFormer(nn.Module):
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
         target_tokens = ns_tokens[:, self.item_token_slice, :]
+        target_summary = self._mean_tokens(target_tokens)
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
         seq_masks_list = []
-        for domain in self.seq_domains:
+        seq_time_buckets_list = []
+        for domain_idx, domain in enumerate(self.seq_domains):
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain])
+            if self.domain_embedding is not None:
+                domain_ids = torch.full(
+                    (tokens.shape[0], tokens.shape[1]),
+                    domain_idx,
+                    dtype=torch.long,
+                    device=tokens.device,
+                )
+                tokens = tokens + self.domain_embedding(domain_ids)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
+            seq_time_buckets_list.append(inputs.seq_time_buckets[domain])
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(
@@ -1824,8 +2014,11 @@ class PCVRHyFormer(nn.Module):
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+            target_summary=target_summary,
+            seq_time_buckets_list=seq_time_buckets_list,
             apply_dropout=self.training
         )
+        output = self._apply_explicit_cross_head(output, ns_tokens, target_summary)
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -1848,18 +2041,29 @@ class PCVRHyFormer(nn.Module):
 
         ns_tokens = torch.cat(ns_parts, dim=1)
         target_tokens = ns_tokens[:, self.item_token_slice, :]
+        target_summary = self._mean_tokens(target_tokens)
 
         seq_tokens_list = []
         seq_masks_list = []
-        for domain in self.seq_domains:
+        seq_time_buckets_list = []
+        for domain_idx, domain in enumerate(self.seq_domains):
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain])
+            if self.domain_embedding is not None:
+                domain_ids = torch.full(
+                    (tokens.shape[0], tokens.shape[1]),
+                    domain_idx,
+                    dtype=torch.long,
+                    device=tokens.device,
+                )
+                tokens = tokens + self.domain_embedding(domain_ids)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
+            seq_time_buckets_list.append(inputs.seq_time_buckets[domain])
 
         q_tokens_list = self.query_generator(
             ns_tokens, seq_tokens_list, seq_masks_list,
@@ -1868,8 +2072,11 @@ class PCVRHyFormer(nn.Module):
 
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+            target_summary=target_summary,
+            seq_time_buckets_list=seq_time_buckets_list,
             apply_dropout=False
         )
+        output = self._apply_explicit_cross_head(output, ns_tokens, target_summary)
 
         logits = self.clsfier(output)
         return logits, output
