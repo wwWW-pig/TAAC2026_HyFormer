@@ -17,6 +17,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --reinit_cardinality_threshold 0 \
+    --use_amp \
+    --amp_dtype bf16 \
     --num_workers 8 \
     "$@"
 
